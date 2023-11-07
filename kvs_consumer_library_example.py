@@ -10,13 +10,56 @@ __status__ = "Development"
 __copyright__ = "Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved."
 __author__ = "Dean Colcott <https://www.linkedin.com/in/deancolcott/>"
 
+
 import os
+from io import BytesIO
 import sys
 import time
+import random
+import math
+import json
+import string
+
 import boto3
+import cv2
+import pandas as pd
+from ultralytics import YOLO
 import logging
 from amazon_kinesis_video_consumer_library.kinesis_video_streams_parser import KvsConsumerLibrary
 from amazon_kinesis_video_consumer_library.kinesis_video_fragment_processor import KvsFragementProcessor
+from sort.sort import *
+
+
+def random_string(N=20):
+    return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(N))
+
+
+def convert_to_dynamodb_item(row):
+    item = {}
+    for column, value in row.items():
+        item[column] = str(value)  # Convert values to strings as needed
+    return item
+
+
+def get_car(license_plate, vehicles):
+
+    x1, y1, x2, y2  = license_plate
+
+    foundIt = False
+    for j in range(len(vehicles)):
+        xcar1, ycar1, xcar2, ycar2, score, class_id = vehicles[j]
+
+        if x1 > xcar1 and y1 > ycar1 and x2 < xcar2 and y2 < ycar2:
+            car_indx = j
+            foundIt = True
+            break
+
+    if foundIt:
+        return xcar1, ycar1, xcar2, ycar2
+
+    return -1, -1, -1, -1
+
+
 
 # Config the logger.
 log = logging.getLogger(__name__)
@@ -25,10 +68,28 @@ logging.basicConfig(format="[%(name)s.%(funcName)s():%(lineno)d] - [%(levelname)
                     level=logging.INFO)
 
 # Update the desired region and KVS stream name.
-REGION='[ENTER_REGION]'
-KVS_STREAM01_NAME = '[ENTER_KVS_STREAM_NAME]'   # Stream must be in specified region
+REGION='region-name'
+KVS_STREAM01_NAME = 'stream-name'   # Stream must be in specified region
 
+license_plate_detector = YOLO('../car_and_license_plate_detector.pt')
 
+s3_client = boto3.client('s3', region_name=REGION)
+dynamodb_client = boto3.resource('dynamodb', region_name=REGION)
+sqs_client = boto3.client('sqs', region_name=REGION)
+
+bucket_name = 'bucket-name'
+
+queue_url = 'queue-url'
+
+processed_track_ids = []
+
+data = pd.DataFrame(columns=['fragment_number', 'abs_frame_number', 'frame_number', 'x1', 'y1', 'x2', 'y2', 'x1car', 'y1car', 'x2car', 'y2car', 'class_id', 'track_id'])
+
+counter = 0
+
+fragment_nmrs = []
+
+mot_tracker = Sort()
 class KvsPythonConsumerExample:
     '''
     Example class to demonstrate usage the AWS Kinesis Video Streams KVS) Consumer Library for Python.
@@ -115,6 +176,10 @@ class KvsPythonConsumerExample:
     # KVS Consumer Library call-backs
 
     def on_fragment_arrived(self, stream_name, fragment_bytes, fragment_dom, fragment_receive_duration):
+        global processed_track_ids
+        global counter
+        global data
+        global fragment_nmrs
         '''
         This is the callback for the KvsConsumerLibrary to send MKV fragments as they are received from a stream being processed.
         The KvsConsumerLibrary returns the received fragment as raw bytes and a DOM like structure containing the fragments meta data.
@@ -206,11 +271,111 @@ class KvsPythonConsumerExample:
             one_in_frames_ratio = 5
             log.info('')
             log.info(f'#######  Reading 1 in {one_in_frames_ratio} Frames from fragment as ndarray:')
+            fragment_nmrs.append(str(self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER']))
             ndarray_frames = self.kvs_fragment_processor.get_frames_as_ndarray(fragment_bytes, one_in_frames_ratio)
             for i in range(len(ndarray_frames)):
+
                 ndarray_frame = ndarray_frames[i]
+                H, W, _ = ndarray_frame.shape
                 log.info(f'Frame-{i} Shape: {ndarray_frame.shape}')
             
+                results = license_plate_detector(ndarray_frame, verbose=False)[0]
+
+                cars_detections = [i for i in results.boxes.data.tolist() if int(i[5]) != 0]
+                lc_detections = [i for i in results.boxes.data.tolist() if int(i[5]) == 0]
+
+                lc_detections_ = mot_tracker.update(np.asarray([(x1, y1, x2, y2, score) for x1, y1, x2, y2, score, _ in lc_detections])) if len(lc_detections) > 0 else []
+
+                for detections in lc_detections_:
+                    if len(detections) == 5 and not math.isnan(detections[0]) and not math.isnan(detections[1]) and not math.isnan(detections[2]) and not math.isnan(detections[3]):
+                        x1, y1, x2, y2, track_id =  detections
+                        class_id = 0
+
+                        # print(x1, y1, x2, y2, track_id)
+
+                        x1car, y1car, x2car, y2car = get_car([x1, y1, x2, y2], cars_detections)
+
+                        # print(x1car, y1car, x2car, y2car)
+
+                        license_plate_crop = ndarray_frame[int(y1):int(y2), int(x1):int(x2), :]
+
+                        ret, buffer = cv2.imencode('.jpg', license_plate_crop)
+                        bytes_io = BytesIO(buffer)
+
+                        first_seen_track = 1 if track_id not in processed_track_ids else 0
+                        if track_id not in processed_track_ids:
+                        	processed_track_ids.append(track_id)
+                        key = '{}_{}_{}_{}.jpg'.format(str(int(track_id)), self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER'], str(int(one_in_frames_ratio * i)), first_seen_track)
+                        if int(x1car) != -1: s3_client.upload_fileobj(bytes_io, bucket_name, key)
+
+                        new_row = {'fragment_number': str(self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER']), 
+                                    'abs_frame_number': counter + int(one_in_frames_ratio * i),
+                                    'frame_number': int(one_in_frames_ratio * i),
+                                    'x1': float(x1),
+                                    'y1': float(y1),
+                                    'x2': float(x2),
+                                    'y2': float(y2),
+                                    'x1car': float(x1car),
+                                    'y1car': float(y1car),
+                                    'x2car': float(x2car),
+                                    'y2car': float(y2car),
+                                    'class_id': int(class_id) if int(class_id) in [0, 1] else 1,
+                                    'track_id': int(track_id)
+                                    }
+                        if int(x1car) != -1: data.loc[len(data.index)] = list(new_row.values())
+
+
+            unique_values = data[(data['class_id'] == 0) & (data['fragment_number'] == str(self.last_good_fragment_tags['AWS_KINESISVIDEO_FRAGMENT_NUMBER']))]['track_id'].unique()
+            print(unique_values)
+            for value in unique_values:
+                # data_ = pd.concat([data, tmp], ignore_index=True)
+                new_df = data[data['track_id'] == value]
+                all_values_abs_frames = list(range(min(new_df['abs_frame_number']), 1 + max(new_df['abs_frame_number'])))
+                missing_values = list(set(all_values_abs_frames) - set(list(new_df['abs_frame_number'])))
+                new_rows = [{'abs_frame_number': value_, 'class_id': new_df['class_id'].iloc[0], 'track_id': new_df['track_id'].iloc[0]} for value_ in missing_values]
+                new_df_ = pd.DataFrame(new_rows)
+                new_df = pd.concat([new_df, new_df_], ignore_index=True)
+                new_df = new_df.sort_values(by='abs_frame_number')
+                new_df['x1'] = new_df['x1'].interpolate(method='linear')
+                new_df['x2'] = new_df['x2'].interpolate(method='linear')
+                new_df['y1'] = new_df['y1'].interpolate(method='linear')
+                new_df['y2'] = new_df['y2'].interpolate(method='linear')
+                new_df['x1car'] = new_df['x1car'].interpolate(method='linear')
+                new_df['x2car'] = new_df['x2car'].interpolate(method='linear')
+                new_df['y1car'] = new_df['y1car'].interpolate(method='linear')
+                new_df['y2car'] = new_df['y2car'].interpolate(method='linear')
+                new_df['frame_number'] = new_df['abs_frame_number'] % 250
+                new_df['fragment_number'].fillna(method='ffill', inplace=True)
+                data = pd.concat([data, new_df])
+                data = data.sort_values(by='abs_frame_number')
+
+
+
+            data = data.drop_duplicates(keep='first')
+
+            data.to_csv('tmp.csv', index=False)
+            s3_client.upload_file('tmp.csv', bucket_name, 'tmp.csv')
+
+            if len(fragment_nmrs) > 0:
+                df = data[data['fragment_number']==fragment_nmrs[-1]]
+
+                df.to_csv('tmp.csv', index=False)
+                s3_client.upload_file('tmp.csv', bucket_name, '{}.csv'.format(fragment_nmrs[-1]))
+
+                table = dynamodb_client.Table('object-detection-output')
+
+                with table.batch_writer() as batch:
+                    for index, row in df.iterrows():
+                        item = convert_to_dynamodb_item(row)
+                        print(item)
+                        batch.put_item(Item=item)
+
+                response = sqs_client.send_message(
+                    QueueUrl=queue_url,
+                    MessageBody=json.dumps({'fragment_number': fragment_nmrs[-1]}),
+                    MessageGroupId=fragment_nmrs[-1],
+                    MessageDeduplicationId=random_string()
+                )
             ###########################################
             # 5) Save Frames from Fragment to local disk as JPGs
             ###########################################
@@ -231,6 +396,8 @@ class KvsPythonConsumerExample:
             #for i in range(len(jpeg_paths)):
             #    jpeg_path = jpeg_paths[i]
             #    print(f'Saved JPEG-{i} Path: {jpeg_path}')
+
+            counter += 250
 
         except Exception as err:
             log.error(f'on_fragment_arrived Error: {err}')
@@ -253,8 +420,6 @@ class KvsPythonConsumerExample:
                 Name of the stream as set when the KvsConsumerLibrary thread triggering this callback was initiated.
                 Use this to identify a fragment when multiple streams are read from different instances of KvsConsumerLibrary to this callback.
         '''
-
-        # Do something here to tell the application that reading from the stream ended gracefully.
         print(f'Read Media on stream: {stream_name} Completed successfully - Last Fragment Tags: {self.last_good_fragment_tags}')
 
     def on_stream_read_exception(self, stream_name, error):
@@ -305,4 +470,3 @@ if __name__ == "__main__":
     
     kvsConsumerExample = KvsPythonConsumerExample()
     kvsConsumerExample.service_loop()
-
