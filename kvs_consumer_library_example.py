@@ -79,6 +79,8 @@ sqs_client = boto3.client('sqs', region_name=REGION)
 
 bucket_name = 'bucket-name'
 
+table_name = 'table-name'
+
 queue_url = 'queue-url'
 
 processed_track_ids = []
@@ -353,16 +355,16 @@ class KvsPythonConsumerExample:
 
             data = data.drop_duplicates(keep='first')
 
-            data.to_csv('tmp.csv', index=False)
-            s3_client.upload_file('tmp.csv', bucket_name, 'tmp.csv')
+            # data.to_csv('tmp.csv', index=False)
+            # s3_client.upload_file('tmp.csv', bucket_name, 'tmp.csv')
 
             if len(fragment_nmrs) > 0:
                 df = data[data['fragment_number']==fragment_nmrs[-1]]
 
-                df.to_csv('tmp.csv', index=False)
-                s3_client.upload_file('tmp.csv', bucket_name, '{}.csv'.format(fragment_nmrs[-1]))
+                # df.to_csv('tmp.csv', index=False)
+                # s3_client.upload_file('tmp.csv', bucket_name, '{}.csv'.format(fragment_nmrs[-1]))
 
-                table = dynamodb_client.Table('object-detection-output')
+                table = dynamodb_client.Table(table_name)
 
                 with table.batch_writer() as batch:
                     for index, row in df.iterrows():
