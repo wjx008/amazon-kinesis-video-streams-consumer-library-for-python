@@ -19,7 +19,6 @@ import cv2
 import logging
 from amazon_kinesis_video_consumer_library.kinesis_video_streams_parser import KvsConsumerLibrary
 from amazon_kinesis_video_consumer_library.kinesis_video_fragment_processor import KvsFragementProcessor
-from ultralytics import YOLO
 
 
 # Config the logger.
